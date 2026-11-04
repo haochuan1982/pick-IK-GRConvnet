@@ -28,7 +28,9 @@ pinhole guess is used (focal ~ image width) -- accuracy will suffer.
 
 import argparse
 import json
+import re
 import sys
+import tempfile
 from pathlib import Path
 
 import cv2
@@ -77,6 +79,109 @@ class TerminalKeys:
         return None
 
 
+def urdf_without_meshes(urdf_path: str) -> str:
+    """Write a temp copy of the URDF with mesh geometry replaced by tiny boxes.
+
+    Forward kinematics only needs joints/links, and placo fails if any referenced mesh
+    file is missing. Returns the temp file path.
+    """
+    text = Path(urdf_path).read_text()
+    text = re.sub(r"<mesh\b[^>]*/>", '<box size="0.001 0.001 0.001"/>', text)
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".urdf", delete=False)
+    tmp.write(text)
+    tmp.close()
+    return tmp.name
+
+
+def hand_eye_park(T_a, T_b) -> np.ndarray:
+    """Solve X in  (A_i^-1 A_j) X = X (B_i B_j^-1)  with Park & Martin (1994).
+
+    Same convention as cv2.calibrateHandEye: T_a = gripper->base (or base->gripper for
+    eye-to-hand), T_b = target->cam. Returns X (cam->gripper, or cam->base).
+    """
+    alphas, betas, pairs = [], [], []
+    for i in range(len(T_a)):
+        for j in range(i + 1, len(T_a)):
+            A = inv_T(T_a[i]) @ T_a[j]
+            B = T_b[i] @ inv_T(T_b[j])
+            alphas.append(cv2.Rodrigues(A[:3, :3])[0].ravel())
+            betas.append(cv2.Rodrigues(B[:3, :3])[0].ravel())
+            pairs.append((A, B))
+    M = sum(np.outer(b, a) for a, b in zip(alphas, betas))
+    U, _, Vt = np.linalg.svd(M)
+    Rx = Vt.T @ np.diag([1, 1, np.linalg.det(Vt.T @ U.T)]) @ U.T
+    lhs = np.vstack([A[:3, :3] - np.eye(3) for A, _ in pairs])
+    rhs = np.concatenate([Rx @ B[:3, 3] - A[:3, 3] for A, B in pairs])
+    tx = np.linalg.lstsq(lhs, rhs, rcond=None)[0]
+    return make_T(Rx, tx)
+
+
+def sample_mismatch(T_a, T_b) -> np.ndarray:
+    """Per-sample median |angle(A_ij) - angle(B_ij)| in degrees over all pairs.
+
+    The rotation angle of a relative motion is the same seen from the robot (A) and from
+    the camera (B). A large value flags a bad sample, typically a chessboard whose
+    orientation was detected flipped by 180 degrees.
+    """
+    n = len(T_a)
+    D = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            A = inv_T(T_a[i]) @ T_a[j]
+            B = T_b[i] @ inv_T(T_b[j])
+            D[i, j] = D[j, i] = abs(rot_angle_deg(A[:3, :3]) - rot_angle_deg(B[:3, :3]))
+    return np.array([np.median(np.delete(D[i], i)) for i in range(n)])
+
+
+def fix_board_flips(T_a, T_b, pattern, square, restarts=30):
+    """Undo 180-degree board-orientation flips (corner order reversed by the detector).
+
+    A flipped detection equals the true pose rotated 180 deg about the board centre. Each
+    sample is either kept or flipped; pick the combination whose camera-side rotation
+    angles best agree with the robot-side ones. Returns (corrected T_b, flipped indices).
+    """
+    n = len(T_a)
+    c = np.array([(pattern[0] - 1) * square / 2, (pattern[1] - 1) * square / 2, 0.0])
+    Rz = np.diag([-1.0, -1.0, 1.0])
+    F = make_T(Rz, c - Rz @ c)
+    variants = [[t, t @ F] for t in T_b]
+    ang_a = np.zeros((n, n))
+    ang_b = np.zeros((n, n, 2, 2))
+    for i in range(n):
+        for j in range(i + 1, n):
+            ang_a[i, j] = rot_angle_deg((inv_T(T_a[i]) @ T_a[j])[:3, :3])
+            for fi in range(2):
+                for fj in range(2):
+                    B = variants[i][fi] @ inv_T(variants[j][fj])
+                    ang_b[i, j, fi, fj] = rot_angle_deg(B[:3, :3])
+
+    def cost(mask):
+        return sum(abs(ang_a[i, j] - ang_b[i, j, mask[i], mask[j]])
+                   for i in range(n) for j in range(i + 1, n))
+
+    rng = np.random.default_rng(0)
+    best_mask, best_cost = [0] * n, np.inf
+    for r in range(restarts):
+        mask = [0] * n if r == 0 else [int(x) for x in rng.integers(0, 2, n)]
+        cur = cost(mask)
+        improved = True
+        while improved:
+            improved = False
+            for k in range(n):
+                mask[k] ^= 1
+                new = cost(mask)
+                if new < cur - 1e-9:
+                    cur, improved = new, True
+                else:
+                    mask[k] ^= 1
+        if cur < best_cost:
+            best_mask, best_cost = list(mask), cur
+    # the all-flipped solution is equivalent; report the one with fewer flips
+    if sum(best_mask) > n / 2:
+        best_mask = [1 - m for m in best_mask]
+    return [variants[i][best_mask[i]] for i in range(n)], [i for i, m in enumerate(best_mask) if m]
+
+
 def make_T(R: np.ndarray, t: np.ndarray) -> np.ndarray:
     T = np.eye(4)
     T[:3, :3] = R
@@ -96,45 +201,71 @@ def rot_angle_deg(R: np.ndarray) -> float:
 def load_intrinsics(path: str | None, frame_shape) -> tuple[np.ndarray, np.ndarray]:
     if path:
         data = np.load(path)
-        return data["K"].astype(np.float64), data["dist"].astype(np.float64).ravel()
+        # accept plain K/dist or RealSense-style color_K/color_dist
+        k_key, d_key = ("K", "dist") if "K" in data.files else ("color_K", "color_dist")
+        if k_key not in data.files:
+            sys.exit(f"{path}: expected K/dist or color_K/color_dist, found {data.files}")
+        if "color_size" in data.files and tuple(data["color_size"]) != tuple(frame_shape[1::-1]):
+            print(f"WARNING: intrinsics are for {tuple(data['color_size'])} but frames are "
+                  f"{tuple(frame_shape[1::-1])}; set --width/--height to match.", file=sys.stderr)
+        return data[k_key].astype(np.float64), data[d_key].astype(np.float64).ravel()
     h, w = frame_shape[:2]
     print("WARNING: no intrinsics given, using a rough guess (f = image width).", file=sys.stderr)
     K = np.array([[w, 0, w / 2], [0, w, h / 2], [0, 0, 1]], dtype=np.float64)
     return K, np.zeros(5)
 
 
-def detect_board(gray, pattern, square, K, dist):
-    """Return (T_cam<-target 4x4, corners) or (None, None)."""
-    flags = cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
-    found, corners = cv2.findChessboardCorners(gray, pattern, flags)
-    if not found:
-        return None, None
-    corners = cv2.cornerSubPix(
-        gray, corners, (11, 11), (-1, -1),
-        (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-4),
-    )
+def detect_board(gray, pattern, square, K, dist, max_reproj=2.0):
+    """Return (T_cam<-target 4x4 or None, corners or None, status string).
+
+    corners is returned whenever the pattern was found, even if the pose was rejected,
+    so the preview can show what happened.
+    """
+    corners = None
+    # sector-based detector: much more robust on small / blurry / low-contrast boards
+    found, c = False, None
+    if min(pattern) > 2:  # SB detector needs both dimensions >= 3
+        found, c = cv2.findChessboardCornersSB(gray, pattern, cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_ACCURACY)
+    if found:
+        corners = c
+    else:
+        flags = cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
+        found, c = cv2.findChessboardCorners(gray, pattern, flags)
+        if found:
+            corners = cv2.cornerSubPix(
+                gray, c, (11, 11), (-1, -1),
+                (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-4),
+            )
+    if corners is None:
+        return None, None, "pattern not found (check --board = INNER corners)"
+
     objp = np.zeros((pattern[0] * pattern[1], 3), np.float32)
     objp[:, :2] = np.mgrid[0 : pattern[0], 0 : pattern[1]].T.reshape(-1, 2) * square
     ok, rvec, tvec = cv2.solvePnP(objp, corners, K, dist, flags=cv2.SOLVEPNP_ITERATIVE)
     if not ok:
-        return None, None
-    # reject poses with large reprojection error
+        return None, corners, "solvePnP failed"
     proj, _ = cv2.projectPoints(objp, rvec, tvec, K, dist)
     err = float(np.sqrt(np.mean(np.sum((proj.reshape(-1, 2) - corners.reshape(-1, 2)) ** 2, axis=1))))
-    if err > 1.0:
-        return None, None
+    if err > max_reproj:
+        return None, corners, f"pose rejected: reproj {err:.2f}px > {max_reproj}px"
     R, _ = cv2.Rodrigues(rvec)
-    return make_T(R, tvec), corners
+    return make_T(R, tvec), corners, f"reproj {err:.2f}px"
 
 
 # ----------------------------------------------------------------------------- capture
 def capture(args):
     from lerobot.model.kinematics import RobotKinematics
-    from lerobot.robots.so101_follower import SO101Follower, SO101FollowerConfig
+    try:  # lerobot >= 0.4
+        from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
+    except ImportError:  # older lerobot
+        from lerobot.robots.so101_follower import SO101Follower, SO101FollowerConfig
 
     pattern = tuple(int(x) for x in args.board.lower().split("x"))  # inner corners (cols, rows)
+    if min(pattern) < 3:
+        sys.exit(f"--board {args.board}: OpenCV needs >= 3 inner corners per side "
+                 "(inner corners = squares - 1), so use a board with at least 4x4 squares.")
 
-    kin = RobotKinematics(urdf_path=args.urdf, target_frame_name=EE_FRAME, joint_names=JOINT_NAMES)
+    kin = RobotKinematics(urdf_path=urdf_without_meshes(args.urdf), target_frame_name=EE_FRAME, joint_names=JOINT_NAMES)
 
     robot = SO101Follower(SO101FollowerConfig(port=args.port, id=args.robot_id, use_degrees=True))
     robot.connect()
@@ -161,7 +292,8 @@ def capture(args):
 
     def save_file():
         Path(args.samples).write_text(
-            json.dumps({"K": K.tolist(), "dist": dist.tolist(), "samples": samples}, indent=2))
+            json.dumps({"K": K.tolist(), "dist": dist.tolist(), "board": list(pattern),
+                        "square": args.square, "samples": samples}, indent=2))
 
     do_solve = False
     try:
@@ -171,18 +303,20 @@ def capture(args):
                 if not ok:
                     continue
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                T_cam_target, corners = detect_board(gray, pattern, args.square, K, dist)
-                detected = corners is not None
+                T_cam_target, corners, status = detect_board(gray, pattern, args.square, K, dist, args.max_reproj)
+                detected = T_cam_target is not None
 
                 # preview: mark detection
                 vis = frame.copy()
-                if detected:
+                if corners is not None:
                     cv2.drawChessboardCorners(vis, pattern, corners, True)
+                if detected:
                     rvec, _ = cv2.Rodrigues(T_cam_target[:3, :3])
                     cv2.drawFrameAxes(vis, K, dist, rvec, T_cam_target[:3, 3], args.square * 3)
                 color = (0, 255, 0) if detected else (0, 0, 255)
                 cv2.putText(vis, "DETECTED - press s to save" if detected else "NOT DETECTED",
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+                cv2.putText(vis, status, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 cv2.putText(vis, f"samples: {len(samples)}/{MIN_SAMPLES}"
                             + ("  (c = calculate)" if len(samples) >= MIN_SAMPLES else ""),
                             (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
@@ -247,17 +381,41 @@ def solve(args):
         # eye-to-hand: feed base->gripper, output: cam->base
         A = [inv_T(T) for T in T_bg]
 
+    pattern = tuple(data.get("board") or [int(x) for x in args.board.lower().split("x")])
+    square = data.get("square") or args.square
+    T_ct, flipped = fix_board_flips(A, T_ct, pattern, square)
+    if flipped:
+        print(f"corrected 180-degree board flips in samples {flipped}")
+
+    # drop samples whose board pose is still inconsistent with the robot motion
+    mism = sample_mismatch(A, T_ct)
+    keep = [i for i, m in enumerate(mism) if m <= args.max_mismatch]
+    for i, m in enumerate(mism):
+        if i not in keep:
+            print(f"sample {i}: rejected, rotation mismatch {m:.1f} deg (noisy board pose or bad sample)")
+    if len(keep) < 3:
+        sys.exit(f"Only {len(keep)} consistent samples left; recapture with a stable board detection.")
+    A = [A[i] for i in keep]
+    T_ct = [T_ct[i] for i in keep]
+    T_bg = [T_bg[i] for i in keep]
+    print(f"using {len(keep)}/{len(mism)} samples")
+
     results = {}
-    for name, m in METHODS.items():
-        try:
-            R, t = cv2.calibrateHandEye(
-                [T[:3, :3] for T in A], [T[:3, 3].reshape(3, 1) for T in A],
-                [T[:3, :3] for T in T_ct], [T[:3, 3].reshape(3, 1) for T in T_ct],
-                method=m,
-            )
-            results[name] = make_T(R, t)
-        except cv2.error as e:
-            print(f"{name}: failed ({e.msg.strip()})")
+    if hasattr(cv2, "calibrateHandEye"):
+        for name, m in METHODS.items():
+            try:
+                R, t = cv2.calibrateHandEye(
+                    [T[:3, :3] for T in A], [T[:3, 3].reshape(3, 1) for T in A],
+                    [T[:3, :3] for T in T_ct], [T[:3, 3].reshape(3, 1) for T in T_ct],
+                    method=m,
+                )
+                results[name] = make_T(R, t)
+            except cv2.error as e:
+                print(f"{name}: failed ({e.msg.strip()})")
+    else:  # e.g. OpenCV 5.0 does not expose calibrateHandEye
+        print(f"cv2 {cv2.__version__} has no calibrateHandEye; using built-in Park-Martin solver "
+              "(install opencv-python==4.12.0.88 for all five methods).")
+        results["PARK"] = hand_eye_park(A, T_ct)
 
     if not results:
         sys.exit("All methods failed")
@@ -308,6 +466,10 @@ def main():
         sp.add_argument("--mode", choices=["eye-in-hand", "eye-to-hand"], required=True)
         sp.add_argument("--samples", default="samples.json")
         sp.add_argument("--output", default="hand_eye_result.json")
+        sp.add_argument("--board", default="9x6", help="chessboard INNER corners, COLSxROWS")
+        sp.add_argument("--square", type=float, default=0.025, help="square size in meters")
+        sp.add_argument("--max-mismatch", type=float, default=10.0,
+                        help="drop samples whose camera/robot rotation angles disagree by more than this (deg)")
         sp.add_argument("--method", choices=list(METHODS), help="force a method (default: most consistent)")
 
     c = sub.add_parser("capture", help="collect samples interactively, then solve")
@@ -318,9 +480,8 @@ def main():
     c.add_argument("--camera", default="0", help="camera index or device/path")
     c.add_argument("--width", type=int, default=640)
     c.add_argument("--height", type=int, default=480)
-    c.add_argument("--board", default="9x6", help="chessboard INNER corners, COLSxROWS")
-    c.add_argument("--square", type=float, default=0.025, help="square size in meters")
     c.add_argument("--intrinsics", help=".npz with K and dist")
+    c.add_argument("--max-reproj", type=float, default=2.0, help="reject board poses above this RMS reprojection error (px)")
     c.set_defaults(func=capture)
 
     s = sub.add_parser("solve", help="solve from a saved samples file")

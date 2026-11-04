@@ -9,7 +9,7 @@
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.10 (tested with lerobot 0.4.4)
 - An SO101 arm that has already been calibrated with LeRobot
 - A printed chessboard on a rigid, flat surface
 - The SO101 URDF from the [SO-ARM100 repo](https://github.com/TheRobotStudio/SO-ARM100) (e.g. `so101_new_calib.urdf`). The end-effector frame must be named `gripper_frame_link`.
@@ -20,7 +20,7 @@ pip install -r requirements.txt
 
 ## Camera intrinsics
 
-Pass an `.npz` file with `K` (3x3 camera matrix) and `dist` (distortion coefficients) via `--intrinsics`. Without it, the script uses a rough guess (focal length = image width) and warns you, so calibrate the camera intrinsics first for good results.
+Pass an `.npz` file with `K` (3x3 camera matrix) and `dist` (distortion coefficients), or RealSense-style `color_K` and `color_dist`, via `--intrinsics`. Without it, the script uses a rough guess (focal length = image width) and warns you, so calibrate the camera intrinsics first for good results.
 
 ```python
 np.savez("intrinsics.npz", K=K, dist=dist)
@@ -68,6 +68,8 @@ python hand_eye_calibration.py solve --samples samples.json --mode eye-in-hand
 | `--board` | `9x6` | Chessboard **inner corners**, columns x rows |
 | `--square` | `0.025` | Square size in meters |
 | `--intrinsics` | none | `.npz` with `K` and `dist` |
+| `--max-mismatch` | `10` | Drop samples whose camera and robot rotation angles disagree by more than this (deg) |
+| `--max-reproj` | `2.0` | Reject board poses with RMS reprojection error above this (px) |
 | `--samples` | `samples.json` | Samples file (written by capture, read by solve) |
 | `--output` | `hand_eye_result.json` | Result file |
 | `--method` | auto | Force `TSAI`, `PARK`, `HORAUD`, `ANDREFF` or `DANIILIDIS` |
@@ -79,6 +81,12 @@ python hand_eye_calibration.py solve --samples samples.json --mode eye-in-hand
 - Keep the board fully visible and in focus, and avoid motion blur and glare.
 - Use a rigid, flat board and measure the square size accurately.
 - Check the consistency table in the output. The translation std of the supposedly constant board pose should be a few millimeters. If it is much larger, re-check the intrinsics, the board size and the URDF.
+
+## How samples are cleaned in `solve`
+
+- **Board flips:** chessboard detectors sometimes return the corners in reversed order, which flips the board pose by 180 degrees. `solve` finds and corrects these automatically.
+- **Outliers:** the rotation angle between two poses must match in the robot and camera frames. Samples that disagree by more than `--max-mismatch` degrees are dropped.
+- **OpenCV 5:** `cv2.calibrateHandEye` is not available in OpenCV 5.0. The script then uses a built-in Park-Martin solver (one method). Install `opencv-python==4.12.0.88` to get all five methods.
 
 ## Output
 
