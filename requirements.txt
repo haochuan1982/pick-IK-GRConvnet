@@ -1,0 +1,7 @@
+numpy
+opencv-python
+openvino
+pin
+pyyaml
+pyrealsense2
+lerobot[feetech]==0.4.4

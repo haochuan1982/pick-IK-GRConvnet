@@ -21,6 +21,7 @@ Examples
   python hand_eye_calibration.py capture --port /dev/ttyACM0 --urdf SO101/so101_new_calib.urdf \
       --camera 0 --mode eye-in-hand --board 9x6 --square 0.025 --intrinsics intrinsics.npz
   python hand_eye_calibration.py solve --samples samples.json --mode eye-in-hand
+  python hand_eye_calibration.py solve --samples samples.json --mode eye-to-hand --vertical-camera
 
 Intrinsics file (.npz) must contain `K` (3x3) and `dist` (N,). If omitted, a rough
 pinhole guess is used (focal ~ image width) -- accuracy will suffer.
@@ -114,6 +115,48 @@ def hand_eye_park(T_a, T_b) -> np.ndarray:
     rhs = np.concatenate([Rx @ B[:3, 3] - A[:3, 3] for A, B in pairs])
     tx = np.linalg.lstsq(lhs, rhs, rcond=None)[0]
     return make_T(Rx, tx)
+
+
+def hand_eye_vertical(T_a, T_b, rot_weight=0.1):
+    """Eye-to-hand solve for a camera that looks straight down (optical axis = base -z).
+
+    The rotation is constrained to R = Rz(psi) @ diag(1, -1, -1), so only the yaw psi and the
+    translation t of T_base_cam are unknown. The board pose in the gripper frame G is an extra
+    unknown. With T_a = base->gripper and T_b = target->cam the constant is
+        G = T_a[i] @ X @ T_b[i]     (X = T_base_cam)
+    and we minimise the spread of G_i around G (rotation errors weighted by rot_weight m/rad).
+    Returns (X, rms residual in m). Needs scipy.
+    """
+    from scipy.optimize import least_squares
+    from scipy.spatial.transform import Rotation as Rot
+
+    R_down = np.diag([1.0, -1.0, -1.0])
+
+    def build(p):
+        return make_T(Rot.from_euler("z", p[0]).as_matrix() @ R_down, p[1:4])
+
+    def residuals(p):
+        X = build(p)
+        G = make_T(Rot.from_rotvec(p[4:7]).as_matrix(), p[7:10])
+        Gi = inv_T(G)
+        out = []
+        for A, B in zip(T_a, T_b):
+            D = Gi @ A @ X @ B  # identity when perfect
+            out.extend(D[:3, 3])
+            out.extend(rot_weight * Rot.from_matrix(D[:3, :3]).as_rotvec())
+        return np.array(out)
+
+    best = None
+    for psi0 in np.linspace(-np.pi, np.pi, 8, endpoint=False):
+        X0 = build([psi0, 0, 0, 0])
+        t0 = np.zeros(3)
+        G0 = T_a[0] @ X0 @ T_b[0]
+        p0 = np.concatenate([[psi0], t0, Rot.from_matrix(G0[:3, :3]).as_rotvec(), G0[:3, 3]])
+        sol = least_squares(residuals, p0)
+        if best is None or sol.cost < best.cost:
+            best = sol
+    rms = float(np.sqrt(2 * best.cost / len(best.fun)))
+    return build(best.x), rms
 
 
 def sample_mismatch(T_a, T_b) -> np.ndarray:
@@ -417,6 +460,14 @@ def solve(args):
               "(install opencv-python==4.12.0.88 for all five methods).")
         results["PARK"] = hand_eye_park(A, T_ct)
 
+    if args.vertical_camera:
+        if args.mode != "eye-to-hand":
+            sys.exit("--vertical-camera only applies to --mode eye-to-hand")
+        # A = base->gripper here (eye-to-hand), T_ct = target->cam
+        X, rms = hand_eye_vertical(A, T_ct)
+        results["VERTICAL"] = X
+        print(f"vertical-camera solve: residual rms {rms * 1000:.2f} mm-equivalent")
+
     if not results:
         sys.exit("All methods failed")
 
@@ -425,6 +476,9 @@ def solve(args):
     for name, T in results.items():
         rpy = cv2.RQDecomp3x3(T[:3, :3])[0]
         print(f"{name:11s} t = {np.round(T[:3, 3], 4)}  rpy = {np.round(rpy, 2)}")
+        if args.mode == "eye-to-hand":
+            tilt = np.degrees(np.arccos(np.clip(-T[2, 2], -1, 1)))
+            print(f"{'':11s} optical axis tilt from vertical-down = {tilt:.1f} deg")
 
     # Consistency check: the target should be static in a fixed frame.
     #   eye-in-hand: T_base_target = T_bg @ T_gc @ T_ct   (constant)
@@ -444,7 +498,7 @@ def solve(args):
         if err < best_err:
             best, best_err = name, err
 
-    chosen = args.method if args.method else best
+    chosen = args.method if args.method else ("VERTICAL" if args.vertical_camera else best)
     if chosen not in results:
         sys.exit(f"Method {chosen} unavailable")
     X = results[chosen]
@@ -470,7 +524,10 @@ def main():
         sp.add_argument("--square", type=float, default=0.025, help="square size in meters")
         sp.add_argument("--max-mismatch", type=float, default=10.0,
                         help="drop samples whose camera/robot rotation angles disagree by more than this (deg)")
-        sp.add_argument("--method", choices=list(METHODS), help="force a method (default: most consistent)")
+        sp.add_argument("--method", choices=list(METHODS) + ["VERTICAL"], help="force a method (default: most consistent)")
+        sp.add_argument("--vertical-camera", action="store_true",
+                        help="eye-to-hand only: the camera looks straight down (optical axis = base -z); "
+                             "solve only yaw + translation, which is far better conditioned (needs scipy)")
 
     c = sub.add_parser("capture", help="collect samples interactively, then solve")
     common(c)
