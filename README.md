@@ -77,28 +77,61 @@ Debug images are written to `out/`: `detection.jpg` (YOLO box) and `grasp.jpg` (
 | `--infer-first` | off | Run the grasp network on the first frame instead of after hovering |
 | `--yes` | off | Skip the confirmation before each motion |
 
-## How the grasp becomes a robot pose
 
-GR-ConvNet outputs four per-pixel maps: quality, cos(2θ), sin(2θ) and width. The best pixel inside the YOLO box gives the grasp centre, angle θ = atan2(sin, cos) / 2 and width (the network's width output times 150, in pixels).
+## How the target pose matrix is obtained
 
-The 2D grasp is lifted to 3D like this:
+The grasp network works in image space. The robot needs a 4x4 matrix `T_base_grasp`: where the gripper tip (`gripper_frame_link`) must be and how it must be oriented, in the robot base frame. `RoboticGrasp.predict_2d` and `RoboticGrasp.to_3d` in `roboticGrasp.py` produce it in these steps.
 
-- The centre pixel plus its depth gives the grasp centre in the base frame.
-- The two jaw end points (centre ± width/2 along the grasp direction) are intersected with a horizontal plane at the grasp height. Their separation is the metric width, and their direction is the gripper yaw.
-- The pose is a top-down grasp: the tool z axis points down and the jaw axis follows that yaw. The reversed jaw axis is the same grasp, and the shorter joint path is used.
+### 1. 2D grasp from the network
 
-## Safety and limits
+A 224x224 RGB-D crop centred on the YOLO box is the input, with channels ordered `[depth, R, G, B]`. RGB and depth are zero-centred, and depth is clipped to [-1, 1]. The network returns four maps, `Q`, `cos(2θ)`, `sin(2θ)` and `width`, which are blurred slightly.
 
-- **Top-down only.** GR-ConvNet predicts top-down grasps. The SO101 has 5 joints, so exact top-down poses are reachable only at low heights (about 7 cm above the table at 20 cm radius, 2-3 cm at 30 cm). The hover height is lowered automatically until it is reachable.
-- **Path checks.** Straight vertical segments (descend, lift) use Cartesian interpolation with IK at each waypoint. Big moves use joint-space interpolation. Both are checked against `--min-z`, joint jumps and reachability before the arm moves.
-- **Occlusion.** The arm hovering over the brick may hide it from the camera. If the brick is not re-detected, the first detection is used. `--infer-first` avoids the problem by running the grasp network before moving.
-- **Place height.** The brick is released from the place pose's height (about 9 cm above the table with the default pose).
-- Start without `--yes`, with the workspace clear.
+The best pixel is taken inside the YOLO box, so the grasp always lands on the brick:
 
-## Things to verify on your hardware
+```
+(u, v)  = argmax Q inside the box          grasp centre, full-image pixels
+θ       = atan2(sin2θ, cos2θ) / 2          image angle, rad (jaw direction in the image is (cos θ, sin θ))
+w_px    = width * 150                      jaw opening, pixels
+```
 
-- **Calibration.** Project the gripper tip into the camera image, or command a known pose, and check the camera reading matches.
-- **Jaw axis.** The default assumes the jaws open along `gripper_frame_link` x. If the gripper is turned 90° at the grasp, use `--jaw-axis y`.
-- **Gripper width.** Measure the jaw opening at `gripper.pos = 100` and set `--gripper-max-width`.
-- **Table height.** `--min-z 0` assumes the table is at base z = 0.
-- **YOLO classes.** The model must have your brick class, or detection will fail.
+The network predicts 2θ because a grasp is the same after a 180° turn. `cos` and `sin` are therefore not put into the matrix directly.
+
+### 2. Position (x, y, z)
+
+The depth `z_c` at the grasp pixel is the median of a small window of valid values. With the colour intrinsics `K`, the pixel becomes a point in the camera frame, and the hand-eye result moves it to the base frame:
+
+```
+p_cam  = [ (u - cx) * z_c / fx,  (v - cy) * z_c / fy,  z_c ]
+p_base = T_base_cam @ [p_cam, 1]
+```
+
+`p_base` is the grasp centre on the top surface of the brick. `main.py` lowers its z by `--grasp-depth` so the fingers straddle the brick.
+
+### 3. Orientation (yaw only)
+
+The grasp is top-down, so only the rotation about the vertical axis comes from the network. The image angle is not that yaw, because the camera's axes are not the robot's axes. The yaw is measured on the table instead:
+
+1. Take the two jaw end pixels `(u, v) ± (w_px / 2) * (cos θ, sin θ)`.
+2. Intersect each pixel's camera ray with the horizontal plane `z = p_base.z` (base frame). This gives two points A and B on the table.
+3. The jaw axis is `a = normalize((B - A)_xy)`, and the metric width is `w_m = |B - A|`.
+
+### 4. Assemble the matrix
+
+The tool z axis (the approach direction) points straight down. The jaw axis (tool x, set with `--jaw-axis`) follows `a`. The tool y axis completes the right-handed frame:
+
+```
+z_tool = [0, 0, -1]
+x_tool = a                       (jaw axis; use y_tool = a instead for --jaw-axis y)
+y_tool = z_tool × x_tool
+
+T_base_grasp = [ x_tool  y_tool  z_tool  p_base ]
+               [   0       0       0       1    ]
+```
+
+`a` and `-a` describe the same grasp. The planner tries both and keeps the one with the shorter joint path. The open width sent to the gripper is `w_m + --width-margin`.
+
+### 5. From matrix to joint motion
+
+Pinocchio inverse kinematics turns `T_base_grasp` into joint angles for the five arm joints. The arm first rotates to this yaw at hover height, then follows a straight vertical line down to the grasp pose. Each waypoint is checked for reachability before anything moves.
+
+Camera and arm axes do not need to line up, because `T_base_cam` from the hand-eye calibration handles that. A wrong calibration shifts `p_base` and the yaw, so the grasp misses.
